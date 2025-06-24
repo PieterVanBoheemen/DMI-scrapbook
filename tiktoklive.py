@@ -10,8 +10,8 @@ from TikTokLive.events.custom_events import FollowEvent, ShareEvent
 from TikTokLive.events.proto_events import JoinEvent
 
 # Configuration
-STREAMER_USERNAME = "@pubgmobileofficialid"  # Change this to the desired streamer
-SESSION_ID = "820ec611d99f71bc20e5398a737fdd48"  # Your session ID for age-restricted streams
+STREAMER_USERNAME = "@user"  # Change this to the desired streamer
+SESSION_ID = ""  # Your session ID for age-restricted streams
 TT_TARGET_IDC = "us-eastred"  # Data center for your session
 
 # Set environment variable to whitelist the sign server (required for session ID)
