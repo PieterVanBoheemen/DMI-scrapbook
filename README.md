@@ -1,6 +1,6 @@
 # DMI Scrapbook
 
-This scrapbook contains scripts I used at the DMI summerschool 25
+This scrapbook contains scripts I used at the DMI summer school 25
 
 * tiktoklive.py TikTok Live Stream Recorder
 
