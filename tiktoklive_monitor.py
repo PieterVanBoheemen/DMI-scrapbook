@@ -150,12 +150,56 @@ class StreamMonitor:
             if session_id:
                 client.web.set_session(session_id, tt_target_idc)
 
-            is_live = await client.is_live()
+            # Add timeout to prevent hanging
+            is_live = await asyncio.wait_for(client.is_live(), timeout=10.0)
             return is_live
 
+        except asyncio.TimeoutError:
+            self.logger.debug(f"Timeout checking {username}")
+            return False
         except Exception as e:
             self.logger.debug(f"Error checking {username}: {e}")
             return False
+
+    async def check_all_streamers_parallel(self, enabled_streamers: dict) -> dict:
+        """Check all streamers in parallel and return their live status"""
+        async def check_single_streamer(streamer_key: str, streamer_config: dict):
+            username = streamer_config['username']
+            try:
+                is_live = await self.check_streamer_status(username)
+                return username, is_live
+            except Exception as e:
+                self.logger.debug(f"Error in parallel check for {username}: {e}")
+                return username, False
+
+        # Create tasks for all streamers
+        tasks = [
+            check_single_streamer(streamer_key, streamer_config)
+            for streamer_key, streamer_config in enabled_streamers.items()
+        ]
+
+        # Run all checks in parallel with a reasonable timeout
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=30.0  # Max 30 seconds for all checks
+            )
+
+            # Process results
+            live_status = {}
+            for result in results:
+                if isinstance(result, tuple):
+                    username, is_live = result
+                    live_status[username] = is_live
+                else:
+                    # Handle exceptions
+                    self.logger.debug(f"Exception in parallel check: {result}")
+
+            return live_status
+
+        except asyncio.TimeoutError:
+            self.logger.warning("⚠️  Parallel streamer check timed out - some checks may be incomplete")
+            return {config['username']: False for config in enabled_streamers.values()}
 
     async def start_recording(self, username: str):
         """Start recording a streamer"""
@@ -397,48 +441,67 @@ class StreamMonitor:
         self.logger.info(f"📋 Monitoring {len([s for s in self.config['streamers'].values() if s.get('enabled', True)])} streamers")
 
         known_live_streamers: Set[str] = set()
+        check_count = 0
 
         while self.monitoring:
             try:
+                check_count += 1
+                start_time = asyncio.get_event_loop().time()
+
                 enabled_streamers = {
                     k: v for k, v in self.config['streamers'].items()
                     if v.get('enabled', True)
                 }
 
-                # Check each enabled streamer
-                for streamer_key, streamer_config in enabled_streamers.items():
-                    username = streamer_config['username']
+                self.logger.debug(f"🔄 Check cycle #{check_count} - Checking {len(enabled_streamers)} streamers in parallel...")
 
-                    try:
-                        is_live = await self.check_streamer_status(username)
+                # Check all streamers in parallel
+                live_status = await self.check_all_streamers_parallel(enabled_streamers)
 
-                        if is_live and username not in known_live_streamers:
-                            # Streamer just went live
-                            self.logger.info(f"🟢 {username} went LIVE!")
-                            known_live_streamers.add(username)
-                            await self.start_recording(username)
+                # Process the results
+                newly_live = []
+                newly_offline = []
 
-                        elif not is_live and username in known_live_streamers:
-                            # Streamer went offline
-                            self.logger.info(f"🔴 {username} went OFFLINE")
-                            known_live_streamers.discard(username)
-                            if username in self.active_recordings:
-                                await self.stop_recording(username, "stream_ended")
+                for username, is_live in live_status.items():
+                    if is_live and username not in known_live_streamers:
+                        # Streamer just went live
+                        newly_live.append(username)
+                        known_live_streamers.add(username)
 
-                        # Small delay between checks
-                        await asyncio.sleep(1)
+                    elif not is_live and username in known_live_streamers:
+                        # Streamer went offline
+                        newly_offline.append(username)
+                        known_live_streamers.discard(username)
 
-                    except Exception as e:
-                        self.logger.debug(f"Error checking {username}: {e}")
+                # Handle newly live streamers
+                for username in newly_live:
+                    self.logger.info(f"🟢 {username} went LIVE!")
+                    asyncio.create_task(self.start_recording(username))
+
+                # Handle newly offline streamers
+                for username in newly_offline:
+                    self.logger.info(f"🔴 {username} went OFFLINE")
+                    if username in self.active_recordings:
+                        asyncio.create_task(self.stop_recording(username, "stream_ended"))
+
+                # Calculate check duration
+                check_duration = asyncio.get_event_loop().time() - start_time
 
                 # Status update
-                if known_live_streamers:
-                    self.logger.info(f"📺 Currently live: {', '.join(known_live_streamers)}")
-                else:
-                    self.logger.info("💤 No streamers currently live")
+                if check_count % 5 == 0 or newly_live or newly_offline:  # Show status every 5 cycles or when changes occur
+                    if known_live_streamers:
+                        self.logger.info(f"📺 Currently live: {', '.join(known_live_streamers)} (check took {check_duration:.1f}s)")
+                    else:
+                        self.logger.info(f"💤 No streamers currently live (check took {check_duration:.1f}s)")
 
-                # Wait before next check cycle
-                await asyncio.sleep(self.config['settings']['check_interval_seconds'])
+                # Dynamic sleep adjustment based on check duration
+                base_interval = self.config['settings']['check_interval_seconds']
+                adjusted_interval = max(5, base_interval - check_duration)  # Minimum 5 seconds
+
+                if check_duration > base_interval * 0.8:  # If check takes more than 80% of interval
+                    self.logger.warning(f"⚠️  Check cycle took {check_duration:.1f}s (target: {base_interval}s)")
+
+                await asyncio.sleep(adjusted_interval)
 
             except Exception as e:
                 self.logger.error(f"Error in monitoring loop: {e}")
