@@ -46,7 +46,7 @@ pip install TikTokLive asyncio
 ```
 
 ### Download the Script
-Save the monitor script as `tiktok_monitor.py`
+Save the monitor script as `tiktoklive_monitor.py`
 
 ---
 
@@ -54,7 +54,7 @@ Save the monitor script as `tiktok_monitor.py`
 
 ### 1. First Run (Creates Default Config)
 ```bash
-python3 tiktok_monitor.py
+python3 tiktoklive_monitor.py
 ```
 This creates `streamers_config.json` with example streamers.
 
@@ -86,7 +86,7 @@ Edit `streamers_config.json`:
 
 ### 3. Run with Session ID (for age-restricted content)
 ```bash
-python3 tiktok_monitor.py --session-id your_tiktok_session_id
+python3 tiktoklive_monitor.py --session-id your_tiktok_session_id
 ```
 
 ---
@@ -97,28 +97,28 @@ python3 tiktok_monitor.py --session-id your_tiktok_session_id
 
 ```bash
 # Basic usage
-python3 tiktok_monitor.py
+python3 tiktoklive_monitor.py
 
 # With session ID for age-restricted streams
-python3 tiktok_monitor.py --session-id your_session_id
+python3 tiktoklive_monitor.py --session-id your_session_id
 
 # Custom configuration file
-python3 tiktok_monitor.py --config my_streamers.json --session-id abc123
+python3 tiktoklive_monitor.py --config my_streamers.json --session-id abc123
 
 # Different data center (EU users)
-python3 tiktok_monitor.py --session-id abc123 --data-center eu-ttp2
+python3 tiktoklive_monitor.py --session-id abc123 --data-center eu-ttp2
 
 # Faster monitoring (every 15 seconds)
-python3 tiktok_monitor.py --session-id abc123 --check-interval 15
+python3 tiktoklive_monitor.py --session-id abc123 --check-interval 15
 
 # Custom output directory
-python3 tiktok_monitor.py --session-id abc123 --output-dir /path/to/recordings
+python3 tiktoklive_monitor.py --session-id abc123 --output-dir /path/to/recordings
 
 # Verbose logging for debugging
-python3 tiktok_monitor.py --session-id abc123 --verbose
+python3 tiktoklive_monitor.py --session-id abc123 --verbose
 
 # Get help
-python3 tiktok_monitor.py --help
+python3 tiktoklive_monitor.py --help
 ```
 
 ### Control Options
@@ -320,7 +320,7 @@ Comprehensive CSV logging of all monitoring activities:
 ### Age-Restricted Content Access
 ```bash
 # Set session ID via command line (recommended)
-python3 tiktok_monitor.py --session-id your_session_id
+python3 tiktoklive_monitor.py --session-id your_session_id
 
 # Or configure in JSON file
 {
@@ -362,7 +362,7 @@ echo "End of study period" > stop_monitor.txt
 #### "Stream is age-restricted"
 **Solution**: Add session ID authentication
 ```bash
-python3 tiktok_monitor.py --session-id your_session_id
+python3 tiktoklive_monitor.py --session-id your_session_id
 ```
 
 #### "No streamers currently live"
