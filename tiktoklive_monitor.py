@@ -426,14 +426,15 @@ class StreamMonitor:
                 'joins': output_dir / f"{username_clean}_{timestamp}_joins.csv"
             }
 
-            # Initialize CSV files
-            self.init_csv_files(csv_files)
+            # Initialize CSV files and keep file handles open
+            csv_writers = self.init_csv_files_with_handles(csv_files)
 
             # Store recording info
             recording_info = {
                 'client': client,
                 'start_time': datetime.now(),
                 'csv_files': csv_files,
+                'csv_writers': csv_writers,  # Keep file handles and writers
                 'stats': {'comments': 0, 'gifts': 0, 'follows': 0, 'shares': 0, 'joins': 0}
             }
 
@@ -452,8 +453,8 @@ class StreamMonitor:
             self.log_session_event(username, 'recording_started', 'failed',
                                  error_message=str(e))
 
-    def init_csv_files(self, csv_files: dict):
-        """Initialize CSV files with headers"""
+    def init_csv_files_with_handles(self, csv_files: dict) -> dict:
+        """Initialize CSV files with headers and return open file handles with writers"""
         headers = {
             'comments': ['timestamp', 'user_id', 'nickname', 'comment', 'follower_count'],
             'gifts': ['timestamp', 'user_id', 'nickname', 'gift_name', 'repeat_count', 'streakable', 'streaking'],
@@ -462,10 +463,20 @@ class StreamMonitor:
             'joins': ['timestamp', 'user_id', 'nickname', 'count', 'is_top_user', 'enter_type', 'action', 'user_share_type', 'client_enter_source']
         }
 
+        csv_writers = {}
         for csv_type, filepath in csv_files.items():
-            with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(headers[csv_type])
+            # Open file and create writer
+            file_handle = open(filepath, 'w', newline='', encoding='utf-8')
+            writer = csv.writer(file_handle)
+            writer.writerow(headers[csv_type])
+
+            # Store both file handle and writer for proper cleanup
+            csv_writers[csv_type] = {
+                'file_handle': file_handle,
+                'writer': writer
+            }
+
+        return csv_writers
 
     def setup_event_handlers(self, client: TikTokLiveClient, username: str, recording_info: dict):
         """Set up event handlers for the client"""
@@ -504,8 +515,8 @@ class StreamMonitor:
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['comments'] += 1
 
-            with open(recording_info['csv_files']['comments'], 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
+            try:
+                writer = recording_info['csv_writers']['comments']['writer']
                 writer.writerow([
                     timestamp_now,
                     getattr(event.user, 'unique_id', ''),
@@ -513,14 +524,18 @@ class StreamMonitor:
                     event.comment,
                     getattr(event.user, 'follower_count', 0)
                 ])
+                # Flush to ensure data is written immediately
+                recording_info['csv_writers']['comments']['file_handle'].flush()
+            except Exception as e:
+                self.logger.error(f"Error writing comment event: {e}")
 
         @client.on(GiftEvent)
         async def on_gift(event: GiftEvent):
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['gifts'] += 1
 
-            with open(recording_info['csv_files']['gifts'], 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
+            try:
+                writer = recording_info['csv_writers']['gifts']['writer']
                 writer.writerow([
                     timestamp_now,
                     getattr(event.user, 'unique_id', ''),
@@ -530,14 +545,17 @@ class StreamMonitor:
                     event.gift.streakable,
                     event.streaking
                 ])
+                recording_info['csv_writers']['gifts']['file_handle'].flush()
+            except Exception as e:
+                self.logger.error(f"Error writing gift event: {e}")
 
         @client.on(FollowEvent)
         async def on_follow(event: FollowEvent):
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['follows'] += 1
 
-            with open(recording_info['csv_files']['follows'], 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
+            try:
+                writer = recording_info['csv_writers']['follows']['writer']
                 writer.writerow([
                     timestamp_now,
                     getattr(event.user, 'unique_id', ''),
@@ -546,14 +564,17 @@ class StreamMonitor:
                     getattr(event, 'share_type', 0),
                     getattr(event, 'action', 0)
                 ])
+                recording_info['csv_writers']['follows']['file_handle'].flush()
+            except Exception as e:
+                self.logger.error(f"Error writing follow event: {e}")
 
         @client.on(ShareEvent)
         async def on_share(event: ShareEvent):
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['shares'] += 1
 
-            with open(recording_info['csv_files']['shares'], 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
+            try:
+                writer = recording_info['csv_writers']['shares']['writer']
                 writer.writerow([
                     timestamp_now,
                     getattr(event.user, 'unique_id', ''),
@@ -564,14 +585,17 @@ class StreamMonitor:
                     getattr(event, 'users_joined', 0) or 0,
                     getattr(event, 'action', 0)
                 ])
+                recording_info['csv_writers']['shares']['file_handle'].flush()
+            except Exception as e:
+                self.logger.error(f"Error writing share event: {e}")
 
         @client.on(JoinEvent)
         async def on_join(event: JoinEvent):
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['joins'] += 1
 
-            with open(recording_info['csv_files']['joins'], 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
+            try:
+                writer = recording_info['csv_writers']['joins']['writer']
                 writer.writerow([
                     timestamp_now,
                     getattr(event.user, 'unique_id', ''),
@@ -583,6 +607,9 @@ class StreamMonitor:
                     getattr(event, 'user_share_type', ''),
                     getattr(event, 'client_enter_source', '')
                 ])
+                recording_info['csv_writers']['joins']['file_handle'].flush()
+            except Exception as e:
+                self.logger.error(f"Error writing join event: {e}")
 
     async def stop_recording(self, username: str, reason: str = "manual"):
         """Stop recording a streamer"""
@@ -619,6 +646,15 @@ class StreamMonitor:
 
                 except Exception as video_error:
                     self.logger.error(f"Error stopping video recording: {video_error}")
+
+            # Close CSV file handles properly
+            if 'csv_writers' in recording_info:
+                for csv_type, csv_info in recording_info['csv_writers'].items():
+                    try:
+                        csv_info['file_handle'].close()
+                        self.logger.debug(f"Closed {csv_type} CSV file for {username}")
+                    except Exception as e:
+                        self.logger.error(f"Error closing {csv_type} CSV file: {e}")
 
             # Disconnect client gracefully
             if client.connected:
