@@ -5,9 +5,11 @@ import os
 import signal
 import sys
 import argparse
+import platform
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 import logging
+from pathlib import Path
 
 from TikTokLive.client.client import TikTokLiveClient
 from TikTokLive.client.logger import LogLevel
@@ -25,23 +27,27 @@ class StreamMonitor:
         self.config_last_modified = self.get_config_mtime()  # Track file modification time
         self.active_recordings: Dict[str, TikTokLiveClient] = {}
         self.monitoring = True
-        self.session_log_file = f"monitoring_sessions_{datetime.now().strftime('%Y%m%d')}.csv"
+        self.is_windows = platform.system() == "Windows"
+
+        # Use Path for cross-platform compatibility
+        self.session_log_file = Path(f"monitoring_sessions_{datetime.now().strftime('%Y%m%d')}.csv")
 
         # File-based termination signals
-        self.stop_file = "stop_monitor.txt"
-        self.pause_file = "pause_monitor.txt"
-        self.status_file = "monitor_status.txt"
+        self.stop_file = Path("stop_monitor.txt")
+        self.pause_file = Path("pause_monitor.txt")
+        self.status_file = Path("monitor_status.txt")
 
         # Override config session_id if provided via command line (after config is loaded)
         if self.global_session_id:
             self.config['settings']['session_id'] = self.global_session_id
 
         # Set up logging with filtered levels
+        log_file = Path(f"monitor_{datetime.now().strftime('%Y%m%d')}.log")
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(f"monitor_{datetime.now().strftime('%Y%m%d')}.log"),
+                logging.FileHandler(log_file, encoding='utf-8'),
                 logging.StreamHandler()
             ]
         )
@@ -74,9 +80,8 @@ class StreamMonitor:
         # Initialize session log
         self.init_session_log()
 
-        # Set up signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
+        # Set up signal handlers for graceful shutdown (Windows compatible)
+        self.setup_signal_handlers()
 
         # Clean up any existing control files
         self.cleanup_control_files()
@@ -84,15 +89,33 @@ class StreamMonitor:
         # Create initial status file
         self.update_status_file("starting")
 
+    def setup_signal_handlers(self):
+        """Set up signal handlers compatible with Windows"""
+        try:
+            if self.is_windows:
+                # Windows supports limited signals
+                signal.signal(signal.SIGINT, self.signal_handler)
+                signal.signal(signal.SIGTERM, self.signal_handler)
+                # SIGBREAK is Windows-specific
+                if hasattr(signal, 'SIGBREAK'):
+                    signal.signal(signal.SIGBREAK, self.signal_handler)
+            else:
+                # Unix-like systems support more signals
+                signal.signal(signal.SIGINT, self.signal_handler)
+                signal.signal(signal.SIGTERM, self.signal_handler)
+                signal.signal(signal.SIGHUP, self.signal_handler)
+        except Exception as e:
+            self.logger.warning(f"Could not set up all signal handlers: {e}")
+
     def cleanup_control_files(self):
         """Remove any existing control files from previous runs"""
-        for file in [self.stop_file, self.pause_file]:
-            if os.path.exists(file):
+        for file_path in [self.stop_file, self.pause_file]:
+            if file_path.exists():
                 try:
-                    os.remove(file)
-                    self.logger.debug(f"Removed existing control file: {file}")
+                    file_path.unlink()
+                    self.logger.debug(f"Removed existing control file: {file_path}")
                 except Exception as e:
-                    self.logger.warning(f"Could not remove {file}: {e}")
+                    self.logger.warning(f"Could not remove {file_path}: {e}")
 
     def update_status_file(self, status: str, extra_info: str = ""):
         """Update the status file with current monitoring state"""
@@ -103,11 +126,12 @@ class StreamMonitor:
                 "active_recordings": len(self.active_recordings),
                 "currently_recording": list(self.active_recordings.keys()),
                 "extra_info": extra_info,
-                "pid": os.getpid()
+                "pid": os.getpid(),
+                "platform": platform.system()
             }
 
             with open(self.status_file, 'w', encoding='utf-8') as f:
-                json.dump(status_info, f, indent=2)
+                json.dump(status_info, f, indent=2, ensure_ascii=False)
 
         except Exception as e:
             self.logger.debug(f"Could not update status file: {e}")
@@ -115,7 +139,7 @@ class StreamMonitor:
     def check_control_signals(self) -> str:
         """Check for file-based control signals"""
         # Check for stop signal
-        if os.path.exists(self.stop_file):
+        if self.stop_file.exists():
             try:
                 with open(self.stop_file, 'r', encoding='utf-8') as f:
                     reason = f.read().strip() or "file_signal"
@@ -124,7 +148,7 @@ class StreamMonitor:
                 return "stop:file_signal"
 
         # Check for pause signal
-        if os.path.exists(self.pause_file):
+        if self.pause_file.exists():
             try:
                 with open(self.pause_file, 'r', encoding='utf-8') as f:
                     duration = f.read().strip()
@@ -139,7 +163,10 @@ class StreamMonitor:
     def get_config_mtime(self) -> float:
         """Get the modification time of the config file"""
         try:
-            return os.path.getmtime(self.config_file)
+            config_path = Path(self.config_file)
+            if config_path.exists():
+                return config_path.stat().st_mtime
+            return 0.0
         except Exception:
             return 0.0
 
@@ -233,23 +260,24 @@ class StreamMonitor:
             }
         }
 
-        if os.path.exists(self.config_file):
+        config_path = Path(self.config_file)
+        if config_path.exists():
             try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except Exception as e:
                 self.logger.error(f"Error loading config: {e}")
                 return default_config
         else:
             # Create default config file
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(default_config, f, indent=2)
-            self.logger.info(f"Created default config file: {self.config_file}")
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Created default config file: {config_path}")
             return default_config
 
     def init_session_log(self):
         """Initialize the session monitoring log CSV"""
-        if not os.path.exists(self.session_log_file):
+        if not self.session_log_file.exists():
             with open(self.session_log_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -383,19 +411,19 @@ class StreamMonitor:
                 client.web.set_session(session_id, tt_target_idc)
                 self.logger.debug(f"🔑 Session ID configured for {username}")
 
-            # Set up file paths
+            # Set up file paths using Path for cross-platform compatibility
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             username_clean = username.replace("@", "")
-            output_dir = self.config['settings']['output_directory']
-            os.makedirs(output_dir, exist_ok=True)
+            output_dir = Path(self.config['settings']['output_directory'])
+            output_dir.mkdir(parents=True, exist_ok=True)
 
             # Create CSV files
             csv_files = {
-                'comments': f"{output_dir}/{username_clean}_{timestamp}_comments.csv",
-                'gifts': f"{output_dir}/{username_clean}_{timestamp}_gifts.csv",
-                'follows': f"{output_dir}/{username_clean}_{timestamp}_follows.csv",
-                'shares': f"{output_dir}/{username_clean}_{timestamp}_shares.csv",
-                'joins': f"{output_dir}/{username_clean}_{timestamp}_joins.csv"
+                'comments': output_dir / f"{username_clean}_{timestamp}_comments.csv",
+                'gifts': output_dir / f"{username_clean}_{timestamp}_gifts.csv",
+                'follows': output_dir / f"{username_clean}_{timestamp}_follows.csv",
+                'shares': output_dir / f"{username_clean}_{timestamp}_shares.csv",
+                'joins': output_dir / f"{username_clean}_{timestamp}_joins.csv"
             }
 
             # Initialize CSV files
@@ -449,13 +477,14 @@ class StreamMonitor:
             # Start video recording with error handling
             timestamp = recording_info['start_time'].strftime("%Y%m%d_%H%M%S")
             username_clean = username.replace("@", "")
-            video_file = f"{self.config['settings']['output_directory']}/{username_clean}_{timestamp}.mp4"
+            output_dir = Path(self.config['settings']['output_directory'])
+            video_file = output_dir / f"{username_clean}_{timestamp}.mp4"
 
             try:
                 # Ensure the video recording starts properly
                 if hasattr(client.web, 'fetch_video_data'):
                     client.web.fetch_video_data.start(
-                        output_fp=video_file,
+                        output_fp=str(video_file),  # Convert Path to string for compatibility
                         room_info=client.room_info,
                         output_format="mp4"
                     )
@@ -579,8 +608,8 @@ class StreamMonitor:
 
                         # Check if video file exists and has content
                         video_file = recording_info.get('video_file')
-                        if video_file and os.path.exists(video_file):
-                            file_size = os.path.getsize(video_file) / (1024 * 1024)  # MB
+                        if video_file and Path(video_file).exists():
+                            file_size = Path(video_file).stat().st_size / (1024 * 1024)  # MB
                             self.logger.info(f"📁 Video file size: {file_size:.1f} MB")
 
                             if file_size < 0.1:  # Less than 100KB might indicate corruption
@@ -617,6 +646,7 @@ class StreamMonitor:
     async def monitor_streamers(self):
         """Main monitoring loop"""
         self.logger.info("🔍 Starting TikTok streamer monitor...")
+        self.logger.info(f"🖥️  Platform: {platform.system()} {platform.release()}")
         self.logger.info(f"📋 Monitoring {len([s for s in self.config['streamers'].values() if s.get('enabled', True)])} streamers")
         self.logger.info("📄 Control files:")
         self.logger.info(f"   • Create '{self.stop_file}' to stop monitoring gracefully")
@@ -650,8 +680,8 @@ class StreamMonitor:
                     self.update_status_file("paused", f"Paused for {duration} seconds")
 
                     # Remove pause file and wait
-                    if os.path.exists(self.pause_file):
-                        os.remove(self.pause_file)
+                    if self.pause_file.exists():
+                        self.pause_file.unlink()
 
                     await asyncio.sleep(duration)
                     self.logger.info("▶️  Resuming monitoring...")
@@ -738,13 +768,18 @@ class StreamMonitor:
 
     def signal_handler(self, signum, frame):
         """Handle shutdown signals"""
-        self.logger.info(f"🛑 Received signal {signum}. Shutting down...")
+        signal_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+        self.logger.info(f"🛑 Received signal {signal_name} ({signum}). Shutting down...")
         self.monitoring = False
 
         # Stop all active recordings
-        loop = asyncio.get_event_loop()
-        for username in list(self.active_recordings.keys()):
-            loop.create_task(self.stop_recording(username, "shutdown"))
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                for username in list(self.active_recordings.keys()):
+                    loop.create_task(self.stop_recording(username, "shutdown"))
+        except Exception as e:
+            self.logger.error(f"Error handling signal: {e}")
 
     async def run(self):
         """Run the monitor"""
@@ -772,10 +807,14 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 tiktok_monitor.py
-  python3 tiktok_monitor.py --session-id your_session_id_here
-  python3 tiktok_monitor.py --config custom_config.json --session-id abc123
-  python3 tiktok_monitor.py --session-id abc123 --data-center eu-ttp2
+  python tiktok_monitor.py
+  python tiktok_monitor.py --session-id your_session_id_here
+  python tiktok_monitor.py --config custom_config.json --session-id abc123
+  python tiktok_monitor.py --session-id abc123 --data-center eu-ttp2
+
+Windows Examples:
+  python.exe tiktok_monitor.py
+  py -3 tiktok_monitor.py --session-id your_session_id_here
         """
     )
 
@@ -822,7 +861,26 @@ def main():
     """Main entry point"""
     args = parse_args()
 
+    # Windows-specific console setup
+    if platform.system() == "Windows":
+        try:
+            # Enable ANSI escape sequences on Windows 10+
+            import subprocess
+            subprocess.run("", shell=True, check=True)
+
+            # Set console to UTF-8 if possible
+            try:
+                import sys
+                import codecs
+                sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+                sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+            except:
+                pass
+        except:
+            pass
+
     print("🚀 TikTok Live Stream Monitor Starting...")
+    print(f"🖥️  Platform: {platform.system()} {platform.release()}")
     print(f"📁 Configuration file: {args.config}")
 
     if args.session_id:
@@ -839,13 +897,28 @@ def main():
     print("   • Create 'pause_monitor.txt' to pause monitoring temporarily")
     print("   • Check 'monitor_status.txt' for current status")
     print("   • Edit config file to modify streamers (auto-reloads)")
-    print("⏹️  Press Ctrl+C for immediate stop\n")
+
+    if platform.system() == "Windows":
+        print("⏹️  Press Ctrl+C or Ctrl+Break for immediate stop")
+        print("💡 Windows users: Use 'py -3' instead of 'python3' if needed")
+    else:
+        print("⏹️  Press Ctrl+C for immediate stop")
+    print()
 
     # Create monitor with command line arguments
-    monitor = StreamMonitor(
-        config_file=args.config,
-        session_id=args.session_id
-    )
+    try:
+        monitor = StreamMonitor(
+            config_file=args.config,
+            session_id=args.session_id
+        )
+    except Exception as e:
+        print(f"❌ Failed to initialize monitor: {e}")
+        if platform.system() == "Windows":
+            print("💡 Windows troubleshooting:")
+            print("   • Make sure Python is in your PATH")
+            print("   • Try running as administrator if file permissions are an issue")
+            print("   • Check that all required Python packages are installed")
+        sys.exit(1)
 
     # Apply command line overrides
     if args.data_center:
@@ -868,9 +941,24 @@ def main():
         monitor.logger.info("📝 Verbose logging enabled")
 
     try:
+        if platform.system() == "Windows":
+            # Windows-specific event loop policy for better compatibility
+            try:
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            except AttributeError:
+                # Fallback for older Python versions
+                pass
+
         asyncio.run(monitor.run())
+    except KeyboardInterrupt:
+        print("\n👋 Monitor stopped by user")
     except Exception as e:
         print(f"❌ Fatal error: {e}")
+        if platform.system() == "Windows":
+            print("💡 Windows troubleshooting:")
+            print("   • Check Windows Defender/Antivirus isn't blocking the script")
+            print("   • Ensure you have proper internet connectivity")
+            print("   • Try running the script from Command Prompt as administrator")
         sys.exit(1)
 
 if __name__ == "__main__":
