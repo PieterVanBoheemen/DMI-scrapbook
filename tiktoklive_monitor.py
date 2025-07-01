@@ -435,7 +435,8 @@ class StreamMonitor:
                 'start_time': datetime.now(),
                 'csv_files': csv_files,
                 'csv_writers': csv_writers,  # Keep file handles and writers
-                'stats': {'comments': 0, 'gifts': 0, 'follows': 0, 'shares': 0, 'joins': 0}
+                'stats': {'comments': 0, 'gifts': 0, 'follows': 0, 'shares': 0, 'joins': 0},
+                'is_recording': True  # Flag to track recording state
             }
 
             # Set up event handlers
@@ -512,6 +513,10 @@ class StreamMonitor:
 
         @client.on(CommentEvent)
         async def on_comment(event: CommentEvent):
+            # Check if recording is still active
+            if not recording_info.get('is_recording', False):
+                return
+
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['comments'] += 1
 
@@ -527,10 +532,15 @@ class StreamMonitor:
                 # Flush to ensure data is written immediately
                 recording_info['csv_writers']['comments']['file_handle'].flush()
             except Exception as e:
-                self.logger.error(f"Error writing comment event: {e}")
+                if recording_info.get('is_recording', False):  # Only log if we should still be recording
+                    self.logger.error(f"Error writing comment event: {e}")
 
         @client.on(GiftEvent)
         async def on_gift(event: GiftEvent):
+            # Check if recording is still active
+            if not recording_info.get('is_recording', False):
+                return
+
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['gifts'] += 1
 
@@ -547,10 +557,15 @@ class StreamMonitor:
                 ])
                 recording_info['csv_writers']['gifts']['file_handle'].flush()
             except Exception as e:
-                self.logger.error(f"Error writing gift event: {e}")
+                if recording_info.get('is_recording', False):  # Only log if we should still be recording
+                    self.logger.error(f"Error writing gift event: {e}")
 
         @client.on(FollowEvent)
         async def on_follow(event: FollowEvent):
+            # Check if recording is still active
+            if not recording_info.get('is_recording', False):
+                return
+
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['follows'] += 1
 
@@ -566,10 +581,15 @@ class StreamMonitor:
                 ])
                 recording_info['csv_writers']['follows']['file_handle'].flush()
             except Exception as e:
-                self.logger.error(f"Error writing follow event: {e}")
+                if recording_info.get('is_recording', False):  # Only log if we should still be recording
+                    self.logger.error(f"Error writing follow event: {e}")
 
         @client.on(ShareEvent)
         async def on_share(event: ShareEvent):
+            # Check if recording is still active
+            if not recording_info.get('is_recording', False):
+                return
+
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['shares'] += 1
 
@@ -587,10 +607,15 @@ class StreamMonitor:
                 ])
                 recording_info['csv_writers']['shares']['file_handle'].flush()
             except Exception as e:
-                self.logger.error(f"Error writing share event: {e}")
+                if recording_info.get('is_recording', False):  # Only log if we should still be recording
+                    self.logger.error(f"Error writing share event: {e}")
 
         @client.on(JoinEvent)
         async def on_join(event: JoinEvent):
+            # Check if recording is still active
+            if not recording_info.get('is_recording', False):
+                return
+
             timestamp_now = datetime.now().isoformat()
             recording_info['stats']['joins'] += 1
 
@@ -609,7 +634,8 @@ class StreamMonitor:
                 ])
                 recording_info['csv_writers']['joins']['file_handle'].flush()
             except Exception as e:
-                self.logger.error(f"Error writing join event: {e}")
+                if recording_info.get('is_recording', False):  # Only log if we should still be recording
+                    self.logger.error(f"Error writing join event: {e}")
 
     async def stop_recording(self, username: str, reason: str = "manual"):
         """Stop recording a streamer"""
@@ -622,6 +648,10 @@ class StreamMonitor:
 
         try:
             client = recording_info['client']
+
+            # Mark recording as stopped to prevent new events from writing
+            recording_info['is_recording'] = False
+            self.logger.debug(f"Marked recording as stopped for {username}")
 
             # Stop video recording properly with multiple attempts
             if hasattr(client.web, 'fetch_video_data'):
@@ -647,20 +677,22 @@ class StreamMonitor:
                 except Exception as video_error:
                     self.logger.error(f"Error stopping video recording: {video_error}")
 
-            # Close CSV file handles properly
+            # Disconnect client gracefully first
+            if client.connected:
+                self.logger.debug(f"Disconnecting client for {username}")
+                await client.disconnect()
+                # Give extra time for events to finish processing
+                await asyncio.sleep(2)
+
+            # Close CSV file handles properly after disconnect
             if 'csv_writers' in recording_info:
+                self.logger.debug(f"Closing CSV files for {username}")
                 for csv_type, csv_info in recording_info['csv_writers'].items():
                     try:
                         csv_info['file_handle'].close()
                         self.logger.debug(f"Closed {csv_type} CSV file for {username}")
                     except Exception as e:
-                        self.logger.error(f"Error closing {csv_type} CSV file: {e}")
-
-            # Disconnect client gracefully
-            if client.connected:
-                await client.disconnect()
-                # Give extra time for proper cleanup
-                await asyncio.sleep(1)
+                        self.logger.debug(f"Error closing {csv_type} CSV file: {e}")
 
             # Log session info
             self.log_session_event(
