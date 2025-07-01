@@ -1,0 +1,29 @@
+# TikTok Live Stream Monitor Dependencies
+# Core TikTok API library
+TikTokLive>=6.5.0
+
+# HTTP client (automatically installed with TikTokLive, but specified for clarity)
+httpx>=0.24.0
+
+# WebSocket support (automatically installed with TikTokLive)
+websockets>=11.0
+
+# Protocol buffers support (automatically installed with TikTokLive)
+protobuf>=4.21.0
+
+# JSON schema validation (optional, for config validation)
+jsonschema>=4.17.0
+
+# For video file analysis/repair (optional, for troubleshooting)
+# ffmpeg-python>=0.2.0
+
+# Standard library modules (included with Python 3.7+)
+# - asyncio (built-in)
+# - csv (built-in)
+# - json (built-in)
+# - logging (built-in)
+# - os (built-in)
+# - signal (built-in)
+# - datetime (built-in)
+# - argparse (built-in)
+# - typing (built-in for Python 3.7+)
