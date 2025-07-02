@@ -15,8 +15,8 @@ from pathlib import Path
 from TikTokLive.client.client import TikTokLiveClient
 from TikTokLive.client.logger import LogLevel
 from TikTokLive.events import ConnectEvent, DisconnectEvent, CommentEvent, GiftEvent
-from TikTokLive.events.custom_events import FollowEvent, ShareEvent
-from TikTokLive.events.proto_events import JoinEvent
+from TikTokLive.events.custom_events import FollowEvent, ShareEvent, LiveEndEvent
+from TikTokLive.events.proto_events import JoinEvent, LikeEvent
 
 class StreamMonitor:
     """Monitor multiple TikTok streamers and auto-record when they go live"""
@@ -29,8 +29,15 @@ class StreamMonitor:
         self.active_recordings: Dict[str, dict] = {}
         self.monitoring = True
         self.is_windows = platform.system() == "Windows"
-        self.stream_stability: Dict[str, dict] = {}  # Track recent status changes
-        self.stability_threshold = 3  # Minimum consistent checks before acting
+
+        # Enhanced stability tracking
+        self.stream_stability: Dict[str, dict] = {}
+        self.stability_threshold = self.config['settings'].get('stability_threshold', 3)
+        self.min_action_cooldown = self.config['settings'].get('min_action_cooldown_seconds', 90)
+
+        # New: Disconnect handling settings
+        self.disconnect_confirmation_delay = self.config['settings'].get('disconnect_confirmation_delay_seconds', 30)
+        self.pending_disconnects: Dict[str, dict] = {}
 
         # Use Path for cross-platform compatibility
         self.session_log_file = Path(f"monitoring_sessions_{datetime.now().strftime('%Y%m%d')}.csv")
@@ -95,43 +102,98 @@ class StreamMonitor:
         # Check system file descriptor limits
         self.check_system_limits()
 
+        # Log stability settings
+        self.logger.info(f"📊 Stability settings: threshold={self.stability_threshold}, cooldown={self.min_action_cooldown}s")
+        self.logger.info(f"🔌 Disconnect confirmation delay: {self.disconnect_confirmation_delay}s")
+
     def track_stream_stability(self, username: str, is_live: bool) -> bool:
-        """Track stream status stability to prevent rapid cycling"""
+        """Enhanced stream status stability tracking to prevent rapid cycling"""
         if username not in self.stream_stability:
             self.stream_stability[username] = {
                 'recent_checks': [],
-                'last_action_time': datetime.now()
+                'last_action_time': datetime.now() - timedelta(minutes=10),  # Allow immediate first action
+                'consecutive_live': 0,
+                'consecutive_offline': 0,
+                'last_status': None
             }
 
         stability_info = self.stream_stability[username]
         now = datetime.now()
 
-        # Keep only recent checks (last 5 minutes)
+        # Keep only recent checks (last 10 minutes for better historical context)
         stability_info['recent_checks'] = [
             (timestamp, status) for timestamp, status in stability_info['recent_checks']
-            if now - timestamp < timedelta(minutes=5)
+            if now - timestamp < timedelta(minutes=10)
         ]
 
         # Add current check
         stability_info['recent_checks'].append((now, is_live))
 
-        # Check if status has been consistent
-        recent_statuses = [status for _, status in stability_info['recent_checks'][-self.stability_threshold:]]
+        # Update consecutive counters
+        if is_live:
+            if stability_info['last_status'] == True:
+                stability_info['consecutive_live'] += 1
+                stability_info['consecutive_offline'] = 0
+            else:
+                stability_info['consecutive_live'] = 1
+                stability_info['consecutive_offline'] = 0
+        else:
+            if stability_info['last_status'] == False:
+                stability_info['consecutive_offline'] += 1
+                stability_info['consecutive_live'] = 0
+            else:
+                stability_info['consecutive_offline'] = 1
+                stability_info['consecutive_live'] = 0
 
-        if len(recent_statuses) >= self.stability_threshold:
-            # All recent checks agree
-            if all(status == is_live for status in recent_statuses):
-                # Check if enough time has passed since last action
+        stability_info['last_status'] = is_live
+
+        # Check if status has been consistent for required threshold
+        current_recording = username in self.active_recordings
+
+        # For going live: need consecutive live checks
+        if is_live and not current_recording:
+            if stability_info['consecutive_live'] >= self.stability_threshold:
+                # Check cooldown period
                 time_since_action = now - stability_info['last_action_time']
-                if time_since_action.total_seconds() >= 60:  # Minimum 1 minute between actions
+                if time_since_action.total_seconds() >= self.min_action_cooldown:
                     stability_info['last_action_time'] = now
+                    self.logger.debug(f"✅ {username} stability confirmed for LIVE after {stability_info['consecutive_live']} checks")
                     return True
                 else:
-                    self.logger.debug(f"⏳ Stability check passed for {username}, but waiting for cooldown")
+                    remaining_cooldown = self.min_action_cooldown - time_since_action.total_seconds()
+                    self.logger.debug(f"⏳ {username} stability confirmed but in cooldown ({remaining_cooldown:.0f}s remaining)")
                     return False
+            else:
+                self.logger.debug(f"📊 {username} LIVE tracking: {stability_info['consecutive_live']}/{self.stability_threshold}")
+                return False
 
-        self.logger.debug(f"📊 Stability tracking for {username}: {len(recent_statuses)}/{self.stability_threshold} consistent checks")
+        # For going offline via polling: REMOVED - no longer use polling for termination
+        # Only event-based termination (LiveEndEvent/DisconnectEvent) will stop recordings
+
         return False
+
+    async def handle_disconnect_confirmation(self, username: str):
+        """Handle disconnect confirmation after delay"""
+        await asyncio.sleep(self.disconnect_confirmation_delay)
+
+        # Check if still in pending disconnects and still recording
+        if username in self.pending_disconnects and username in self.active_recordings:
+            try:
+                # Double-check if actually offline
+                is_live = await self.check_streamer_status(username)
+                if not is_live:
+                    self.logger.info(f"🔴 {username} disconnect confirmed after {self.disconnect_confirmation_delay}s - stopping recording")
+                    await self.stop_recording(username, "disconnect_confirmed")
+                else:
+                    self.logger.info(f"🟢 {username} back online after disconnect - continuing recording")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Error confirming disconnect for {username}: {e}")
+                # Assume disconnect is real and stop recording
+                await self.stop_recording(username, "disconnect_error")
+
+        # Clean up pending disconnect
+        if username in self.pending_disconnects:
+            del self.pending_disconnects[username]
 
     def check_system_limits(self):
         """Check system resource limits"""
@@ -197,6 +259,7 @@ class StreamMonitor:
                 "status": status,
                 "active_recordings": len(self.active_recordings),
                 "currently_recording": list(self.active_recordings.keys()),
+                "pending_disconnects": len(self.pending_disconnects),
                 "extra_info": extra_info,
                 "pid": os.getpid(),
                 "platform": platform.system()
@@ -263,6 +326,11 @@ class StreamMonitor:
                 self.config = new_config
                 self.config_last_modified = current_mtime
 
+                # Update stability settings
+                self.stability_threshold = self.config['settings'].get('stability_threshold', 3)
+                self.min_action_cooldown = self.config['settings'].get('min_action_cooldown_seconds', 90)
+                self.disconnect_confirmation_delay = self.config['settings'].get('disconnect_confirmation_delay_seconds', 30)
+
                 # Compare changes
                 new_streamers = set(self.config.get('streamers', {}).keys())
                 new_enabled = {k: v.get('enabled', True) for k, v in self.config.get('streamers', {}).items()}
@@ -324,14 +392,16 @@ class StreamMonitor:
             },
             "settings": {
                 "check_interval_seconds": 60,  # Increased from 30 to reduce API pressure
-                "max_concurrent_recordings": 3,
+                "max_concurrent_recordings": 5,
                 "output_directory": "recordings",
                 "session_id": None,
                 "tt_target_idc": "us-eastred",
                 "whitelist_sign_server": "tiktok.eulerstream.com",
-                "stability_threshold": 3,
-                "min_action_cooldown_seconds": 60,
-                "status_verification_grace_period": 15
+                "stability_threshold": 3,  # Number of consecutive checks needed
+                "min_action_cooldown_seconds": 90,  # Minimum time between actions
+                "disconnect_confirmation_delay_seconds": 30,  # Time to wait before confirming disconnect
+                "individual_check_timeout": 20,  # Timeout per streamer check
+                "max_retries": 2  # Number of retries per check
             }
         }
 
@@ -358,7 +428,7 @@ class StreamMonitor:
                 writer.writerow([
                     'timestamp', 'username', 'action', 'status', 'duration_minutes',
                     'comments_count', 'gifts_count', 'follows_count', 'shares_count',
-                    'joins_count', 'tags', 'notes', 'error_message'
+                    'joins_count', 'likes_count', 'tags', 'notes', 'error_message'
                 ])
 
     def log_session_event(self, username: str, action: str, status: str = 'success',
@@ -381,14 +451,18 @@ class StreamMonitor:
                 stats.get('follows', 0),
                 stats.get('shares', 0),
                 stats.get('joins', 0),
+                stats.get('likes', 0),
                 ';'.join(streamer_config.get('tags', [])),
                 streamer_config.get('notes', ''),
                 error_message
             ])
 
-    async def check_streamer_status(self, username: str, retry_count: int = 2) -> bool:
-        """Check if a streamer is currently live with retry logic"""
-        for attempt in range(retry_count + 1):
+    async def check_streamer_status(self, username: str) -> bool:
+        """Check if a streamer is currently live with enhanced error handling"""
+        max_retries = self.config['settings'].get('max_retries', 2)
+        timeout = self.config['settings'].get('individual_check_timeout', 20)
+
+        for attempt in range(max_retries + 1):
             try:
                 # Ensure environment variable is set for authenticated sessions
                 whitelist_host = self.config['settings'].get('whitelist_sign_server', 'tiktok.eulerstream.com')
@@ -404,8 +478,8 @@ class StreamMonitor:
                 if session_id:
                     client.web.set_session(session_id, tt_target_idc)
 
-                # Increased timeout and better error handling
-                is_live = await asyncio.wait_for(client.is_live(), timeout=15.0)
+                # Check with timeout
+                is_live = await asyncio.wait_for(client.is_live(), timeout=timeout)
 
                 if attempt > 0:  # Log successful retry
                     self.logger.debug(f"✅ Status check succeeded for {username} on attempt {attempt + 1}")
@@ -413,17 +487,17 @@ class StreamMonitor:
                 return is_live
 
             except asyncio.TimeoutError:
-                if attempt < retry_count:
-                    self.logger.debug(f"⏱️ Timeout checking {username}, retrying... (attempt {attempt + 1}/{retry_count + 1})")
-                    await asyncio.sleep(2)  # Brief pause before retry
+                if attempt < max_retries:
+                    self.logger.debug(f"⏱️ Timeout checking {username}, retrying... (attempt {attempt + 1}/{max_retries + 1})")
+                    await asyncio.sleep(3 + attempt)  # Progressive backoff
                     continue
                 else:
-                    self.logger.debug(f"⏱️ Final timeout checking {username} after {retry_count + 1} attempts")
+                    self.logger.debug(f"⏱️ Final timeout checking {username} after {max_retries + 1} attempts")
                     return False
             except Exception as e:
-                if attempt < retry_count:
-                    self.logger.debug(f"⚠️ Error checking {username}: {e}, retrying... (attempt {attempt + 1}/{retry_count + 1})")
-                    await asyncio.sleep(2)
+                if attempt < max_retries:
+                    self.logger.debug(f"⚠️ Error checking {username}: {e}, retrying... (attempt {attempt + 1}/{max_retries + 1})")
+                    await asyncio.sleep(3 + attempt)  # Progressive backoff
                     continue
                 else:
                     self.logger.debug(f"❌ Final error checking {username}: {e}")
@@ -431,40 +505,17 @@ class StreamMonitor:
 
         return False
 
-    async def verify_stream_status(self, username: str, expected_status: bool, grace_period: int = None) -> bool:
-        """Double-check stream status with configurable grace period"""
-        if grace_period is None:
-            grace_period = self.config['settings'].get('status_verification_grace_period', 15)
-
-        try:
-            self.logger.debug(f"🔍 Verifying stream status for {username} (expected: {'live' if expected_status else 'offline'})")
-
-            # Longer wait period to allow for network recovery
-            await asyncio.sleep(grace_period)
-
-            # Check status again with retry
-            actual_status = await self.check_streamer_status(username, retry_count=1)
-
-            if actual_status != expected_status:
-                self.logger.info(f"⚠️ Status verification failed for {username}: expected {'live' if expected_status else 'offline'}, got {'live' if actual_status else 'offline'}")
-                return actual_status
-
-            self.logger.debug(f"✅ Status verified for {username}: {'live' if actual_status else 'offline'}")
-            return expected_status
-
-        except Exception as e:
-            self.logger.debug(f"Error in verification for {username}: {e}")
-            return expected_status  # Return original status if check fails
-
     async def check_all_streamers_parallel(self, enabled_streamers: dict) -> dict:
         """Check all streamers in parallel with improved error handling"""
+        timeout = self.config['settings'].get('individual_check_timeout', 20)
+
         async def check_single_streamer_with_timeout(streamer_key: str, streamer_config: dict):
             username = streamer_config['username']
             try:
-                # Use individual timeout per streamer instead of global timeout
+                # Use individual timeout per streamer
                 is_live = await asyncio.wait_for(
-                    self.check_streamer_status(username, retry_count=1),
-                    timeout=20.0  # Per-streamer timeout
+                    self.check_streamer_status(username),
+                    timeout=timeout + 5  # Add buffer to individual timeout
                 )
                 return username, is_live
             except asyncio.TimeoutError:
@@ -480,7 +531,6 @@ class StreamMonitor:
             for streamer_key, streamer_config in enabled_streamers.items()
         ]
 
-        # Use gather instead of as_completed to fix the async iteration issue
         live_status = {}
 
         try:
@@ -554,7 +604,8 @@ class StreamMonitor:
                 'gifts': output_dir / f"{username_clean}_{timestamp}_gifts.csv",
                 'follows': output_dir / f"{username_clean}_{timestamp}_follows.csv",
                 'shares': output_dir / f"{username_clean}_{timestamp}_shares.csv",
-                'joins': output_dir / f"{username_clean}_{timestamp}_joins.csv"
+                'joins': output_dir / f"{username_clean}_{timestamp}_joins.csv",
+                'likes': output_dir / f"{username_clean}_{timestamp}_likes.csv"
             }
 
             # Initialize CSV files and keep file handles open
@@ -566,7 +617,7 @@ class StreamMonitor:
                 'start_time': datetime.now(),
                 'csv_files': csv_files,
                 'csv_writers': csv_writers,  # Keep file handles and writers
-                'stats': {'comments': 0, 'gifts': 0, 'follows': 0, 'shares': 0, 'joins': 0},
+                'stats': {'comments': 0, 'gifts': 0, 'follows': 0, 'shares': 0, 'joins': 0, 'likes': 0},
                 'is_recording': True  # Flag to track recording state
             }
 
@@ -603,7 +654,8 @@ class StreamMonitor:
             'gifts': ['timestamp', 'user_id', 'nickname', 'gift_name', 'repeat_count', 'streakable', 'streaking'],
             'follows': ['timestamp', 'user_id', 'nickname', 'follow_count', 'share_type', 'action'],
             'shares': ['timestamp', 'user_id', 'nickname', 'share_type', 'share_target', 'share_count', 'users_joined', 'action'],
-            'joins': ['timestamp', 'user_id', 'nickname', 'count', 'is_top_user', 'enter_type', 'action', 'user_share_type', 'client_enter_source']
+            'joins': ['timestamp', 'user_id', 'nickname', 'count', 'is_top_user', 'enter_type', 'action', 'user_share_type', 'client_enter_source'],
+            'likes': ['timestamp', 'user_id', 'nickname', 'count', 'total', 'color', 'effect_cnt']
         }
 
         csv_writers = {}
@@ -662,12 +714,27 @@ class StreamMonitor:
             except Exception as e:
                 self.logger.error(f"Failed to start video recording for {username}: {e}")
 
+        @client.on(LiveEndEvent)
+        async def on_live_end(event: LiveEndEvent):
+            self.logger.info(f"🔴 {username} stream ended (LiveEndEvent received)")
+            # Cancel any pending disconnect confirmations
+            if username in self.pending_disconnects:
+                del self.pending_disconnects[username]
+                self.logger.debug(f"Cancelled pending disconnect confirmation for {username}")
+            # Immediately stop recording when we get the official stream end event
+            await self.stop_recording(username, "live_end_event")
+
         @client.on(DisconnectEvent)
         async def on_disconnect(event: DisconnectEvent):
-            self.logger.info(f"🔌 Disconnect event received for {username}")
-            # Don't immediately stop recording - let the monitoring loop handle it
-            # This prevents false disconnections due to network hiccups
-            pass
+            self.logger.info(f"🔌 Disconnect event received for {username} - confirming in {self.disconnect_confirmation_delay}s")
+
+            # Don't immediately stop recording, but start confirmation process
+            if username not in self.pending_disconnects:
+                self.pending_disconnects[username] = {
+                    'timestamp': datetime.now(),
+                    'task': asyncio.create_task(self.handle_disconnect_confirmation(username))
+                }
+                self.logger.debug(f"Started disconnect confirmation for {username}")
 
         @client.on(CommentEvent)
         async def on_comment(event: CommentEvent):
@@ -795,11 +862,45 @@ class StreamMonitor:
                 if recording_info.get('is_recording', False):  # Only log if we should still be recording
                     self.logger.error(f"Error writing join event: {e}")
 
+        @client.on(LikeEvent)
+        async def on_like(event: LikeEvent):
+            # Check if recording is still active
+            if not recording_info.get('is_recording', False):
+                return
+
+            timestamp_now = datetime.now().isoformat()
+            recording_info['stats']['likes'] += 1
+
+            try:
+                writer = recording_info['csv_writers']['likes']['writer']
+                writer.writerow([
+                    timestamp_now,
+                    getattr(event.user, 'unique_id', ''),
+                    getattr(event.user, 'nickname', ''),
+                    getattr(event, 'count', 0),
+                    getattr(event, 'total', 0),
+                    getattr(event, 'color', 0),
+                    getattr(event, 'effect_cnt', 0)
+                ])
+                recording_info['csv_writers']['likes']['file_handle'].flush()
+            except Exception as e:
+                if recording_info.get('is_recording', False):  # Only log if we should still be recording
+                    self.logger.error(f"Error writing like event: {e}")
+
     async def stop_recording(self, username: str, reason: str = "manual"):
-        """Stop recording a streamer"""
+        """Stop recording a streamer with enhanced error handling"""
         if username not in self.active_recordings:
             self.logger.warning(f"No active recording found for {username}")
             return
+
+        # Cancel any pending disconnect confirmations
+        if username in self.pending_disconnects:
+            try:
+                self.pending_disconnects[username]['task'].cancel()
+                del self.pending_disconnects[username]
+                self.logger.debug(f"Cancelled pending disconnect confirmation for {username}")
+            except Exception as e:
+                self.logger.debug(f"Error cancelling disconnect confirmation: {e}")
 
         recording_info = self.active_recordings[username]
         duration = (datetime.now() - recording_info['start_time']).total_seconds() / 60
@@ -811,10 +912,10 @@ class StreamMonitor:
             recording_info['is_recording'] = False
             self.logger.debug(f"Marked recording as stopped for {username}")
 
-            # Stop video recording properly with multiple attempts
+            # Stop video recording properly with enhanced error handling
             if hasattr(client.web, 'fetch_video_data'):
                 try:
-                    if client.web.fetch_video_data.is_recording:
+                    if hasattr(client.web.fetch_video_data, 'is_recording') and client.web.fetch_video_data.is_recording:
                         self.logger.info(f"🎬 Stopping video recording for {username}...")
                         client.web.fetch_video_data.stop()
 
@@ -833,12 +934,18 @@ class StreamMonitor:
                             self.logger.warning(f"⚠️  Video file not found: {video_file}")
 
                 except Exception as video_error:
-                    self.logger.error(f"Error stopping video recording: {video_error}")
+                    self.logger.debug(f"Error stopping video recording: {video_error}")
 
-            # Disconnect client gracefully first
-            if client.connected:
+            # Disconnect client gracefully with timeout
+            if hasattr(client, 'connected') and client.connected:
                 self.logger.debug(f"Disconnecting client for {username}")
-                await client.disconnect()
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    self.logger.debug(f"Disconnect timeout for {username}")
+                except Exception as e:
+                    self.logger.debug(f"Disconnect error for {username}: {e}")
+
                 # Give extra time for events to finish processing
                 await asyncio.sleep(2)
 
@@ -872,22 +979,24 @@ class StreamMonitor:
         except Exception as e:
             self.logger.error(f"Error stopping recording for {username}: {e}")
         finally:
-            del self.active_recordings[username]
+            # Ensure recording is removed from active list
+            if username in self.active_recordings:
+                del self.active_recordings[username]
 
     async def monitor_streamers(self):
-        """Main monitoring loop with stability tracking"""
+        """Main monitoring loop with enhanced stability tracking"""
         self.logger.info("🔍 Starting TikTok streamer monitor...")
         self.logger.info(f"🖥️  Platform: {platform.system()} {platform.release()}")
         self.logger.info(f"📋 Monitoring {len([s for s in self.config['streamers'].values() if s.get('enabled', True)])} streamers")
+        self.logger.info(f"📊 Stability: {self.stability_threshold} consecutive checks, {self.min_action_cooldown}s cooldown")
+        self.logger.info(f"🔌 Disconnect confirmation: {self.disconnect_confirmation_delay}s delay")
         self.logger.info("📄 Control files:")
         self.logger.info(f"   • Create '{self.stop_file}' to stop monitoring gracefully")
         self.logger.info(f"   • Create '{self.pause_file}' to pause monitoring temporarily")
         self.logger.info(f"   • Check '{self.status_file}' for current status")
         self.logger.info(f"   • Edit '{self.config_file}' to modify streamers list (auto-reloads)")
 
-        known_live_streamers: Set[str] = set()
         check_count = 0
-
         self.update_status_file("monitoring", "Started monitoring loop")
 
         while self.monitoring:
@@ -932,44 +1041,39 @@ class StreamMonitor:
                 # Check all streamers in parallel
                 live_status = await self.check_all_streamers_parallel(enabled_streamers)
 
-                # Process results with stability checking
+                # Process results with ONLY stability checking (no additional verification)
+                actions_taken = []
                 for username, is_live in live_status.items():
-                    current_recording = username in self.active_recordings
+                    # Use stability tracking to determine if action should be taken
+                    if self.track_stream_stability(username, is_live):
+                        current_recording = username in self.active_recordings
 
-                    # Track stability before taking action
-                    if is_live and not current_recording:
-                        # Potential new stream - check stability
-                        if self.track_stream_stability(username, True):
-                            # Verify once more before starting recording
-                            confirmed_live = await self.verify_stream_status(username, True, grace_period=10)
-                            if confirmed_live:
-                                self.logger.info(f"🟢 {username} went LIVE! (stability confirmed)")
-                                asyncio.create_task(self.start_recording(username))
-                                known_live_streamers.add(username)
-                            else:
-                                self.logger.debug(f"🔍 Final verification failed for {username}")
+                        if is_live and not current_recording:
+                            # Start recording
+                            self.logger.info(f"🟢 {username} went LIVE! (stability confirmed)")
+                            asyncio.create_task(self.start_recording(username))
+                            actions_taken.append(f"{username}:LIVE")
 
-                    elif not is_live and current_recording:
-                        # Potential stream end - check stability
-                        if self.track_stream_stability(username, False):
-                            # Verify once more before stopping recording
-                            confirmed_offline = not await self.verify_stream_status(username, False, grace_period=10)
-                            if confirmed_offline:
-                                self.logger.info(f"🔴 {username} went OFFLINE (stability confirmed)")
-                                asyncio.create_task(self.stop_recording(username, "stream_ended"))
-                                known_live_streamers.discard(username)
-                            else:
-                                self.logger.debug(f"🔍 Stream still active for {username}, keeping recording")
+                        elif not is_live and current_recording:
+                            # REMOVED: No longer stop recordings based on polling
+                            # Event-based termination (LiveEndEvent/DisconnectEvent) handles this
+                            self.logger.debug(f"📊 {username} appears offline via polling, but relying on event-based termination")
+                            pass
 
                 # Count results for summary
                 total_checked = len(live_status)
                 currently_live = [username for username, is_live in live_status.items() if is_live]
+                currently_recording = list(self.active_recordings.keys())
+                pending_disconnects = list(self.pending_disconnects.keys())
 
                 # Calculate check duration
                 check_duration = asyncio.get_event_loop().time() - start_time
 
                 # Update status file
-                self.update_status_file("monitoring", f"Check #{check_count}, duration: {check_duration:.1f}s")
+                status_info = f"Check #{check_count}, duration: {check_duration:.1f}s"
+                if pending_disconnects:
+                    status_info += f", pending disconnects: {len(pending_disconnects)}"
+                self.update_status_file("monitoring", status_info)
 
                 # Status update with cleaner output
                 status_msg_parts = [f"📊 Checked {total_checked} streamers"]
@@ -979,16 +1083,23 @@ class StreamMonitor:
                     status_msg_parts.append(f"📺 Live: {', '.join(currently_live)}")
                 else:
                     status_msg_parts.append("💤 None live")
+                if currently_recording:
+                    status_msg_parts.append(f"🎥 Recording: {', '.join(currently_recording)}")
+                if pending_disconnects:
+                    status_msg_parts.append(f"🔌 Pending disconnects: {', '.join(pending_disconnects)}")
                 status_msg_parts.append(f"⏱️ {check_duration:.1f}s")
 
-                if check_count % 5 == 0 or config_changed:  # Show status every 5 cycles or when changes occur
+                # Show status based on activity
+                if actions_taken or config_changed or pending_disconnects or check_count % 5 == 0:
                     self.logger.info(" | ".join(status_msg_parts))
+                    if actions_taken:
+                        self.logger.info(f"🎬 Actions: {', '.join(actions_taken)}")
                 elif check_count % 20 == 0:  # Minimal status every 20 cycles
-                    self.logger.info(f"📊 Check #{check_count} | {total_checked} streamers | {len(currently_live)} live | ⏱️ {check_duration:.1f}s")
+                    self.logger.info(f"📊 Check #{check_count} | {total_checked} streamers | {len(currently_live)} live | {len(currently_recording)} recording | ⏱️ {check_duration:.1f}s")
 
                 # Dynamic sleep adjustment based on check duration
                 base_interval = self.config['settings']['check_interval_seconds']
-                adjusted_interval = max(5, base_interval - check_duration)  # Minimum 5 seconds
+                adjusted_interval = max(10, base_interval - check_duration)  # Minimum 10 seconds
 
                 if check_duration > base_interval * 0.8:  # If check takes more than 80% of interval
                     self.logger.warning(f"⚠️  Check cycle took {check_duration:.1f}s (target: {base_interval}s)")
@@ -1006,12 +1117,21 @@ class StreamMonitor:
         self.logger.info(f"🛑 Received signal {signal_name} ({signum}). Shutting down...")
         self.monitoring = False
 
-        # Stop all active recordings
+        # Stop all active recordings and cancel pending disconnects
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 for username in list(self.active_recordings.keys()):
                     loop.create_task(self.stop_recording(username, "shutdown"))
+
+                # Cancel pending disconnect confirmations
+                for username, pending_info in list(self.pending_disconnects.items()):
+                    try:
+                        pending_info['task'].cancel()
+                    except:
+                        pass
+                self.pending_disconnects.clear()
+
         except Exception as e:
             self.logger.error(f"Error handling signal: {e}")
 
@@ -1024,6 +1144,17 @@ class StreamMonitor:
         finally:
             # Cleanup
             self.update_status_file("shutting_down", "Cleaning up active recordings")
+
+            # Cancel all pending disconnect confirmations
+            for username, pending_info in list(self.pending_disconnects.items()):
+                try:
+                    pending_info['task'].cancel()
+                    self.logger.debug(f"Cancelled pending disconnect for {username}")
+                except:
+                    pass
+            self.pending_disconnects.clear()
+
+            # Stop all active recordings
             for username in list(self.active_recordings.keys()):
                 await self.stop_recording(username, "shutdown")
 
