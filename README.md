@@ -4,7 +4,7 @@ This repo contains scripts that were (vibe) coded during the Digital Methods Ini
 
 * tiktoklive.py: a script to record a single live stream
 * tiktoklive_monitor.py: a script to monitor a pre-defined list of TikTok accounts and record whenever these go live (see details below)
-  *  NOTE: instead of this gigant monolith code, I refactored it to a better structured script available in this repo [TikTokLive_monitor](https://github.com/PieterVanBoheemen/tiktoklive_monitor)
+  *  NOTE: instead of this gigant monolith code, I refactored it to a better structured script available in a dedicated repo. The code here will no longer be maintained [TikTokLive_monitor](https://github.com/PieterVanBoheemen/tiktoklive_monitor)
 
 # TikTok Live Stream Monitor
 
