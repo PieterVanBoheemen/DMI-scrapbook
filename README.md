@@ -1,3 +1,10 @@
+# DMI Scrapbook
+
+This repo contains scripts that were (vibe) coded during the Digital Methods Initiative Summer School 2025:
+
+* tiktoklive.py: a script to record a single live stream
+* tiktoklive_monitor.py: a script to monitor a pre-defined list of TikTok accounts and record whenever these go live (see details below)
+
 # TikTok Live Stream Monitor
 
 An automated monitoring system that watches multiple TikTok streamers and automatically records their live streams with comprehensive data collection for social media research.
@@ -85,6 +92,8 @@ Edit `streamers_config.json`:
 ```
 
 ### 3. Run with Session ID (for age-restricted content)
+WARNING: your session idea is sensitive information, do not share it with any untrusted party as it may result in your account getting stolen
+
 ```bash
 python3 tiktoklive_monitor.py --session-id your_tiktok_session_id
 ```
@@ -453,9 +462,9 @@ MIT License - see LICENSE file for details.
 
 ## Support
 
-- **Issues**: [GitHub Issues](your-repo-url/issues)
+- **Issues**: [GitHub Issues](https://github.com/PieterVanBoheemen/tiktoklive_monitor/issues)
 - **Documentation**: This README and inline code comments
-- **Community**: [Research Discord/Forum if available]
+- **E-mail**: mail@postxsociety.org
 
 ## Disclaimer
 
